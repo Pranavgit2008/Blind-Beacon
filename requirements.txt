@@ -1,0 +1,6 @@
+pyttsx3
+SpeechRecognition
+googletrans==4.0.0-rc1
+opencv-python
+requests
+pyaudio
