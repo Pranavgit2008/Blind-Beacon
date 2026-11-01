@@ -8,7 +8,9 @@ This Python-based voice assistant is designed to assist **visually impaired user
 
 - 🔊 **Voice Interaction**: Recognizes and responds to spoken commands using speech recognition and text-to-speech.
 - 💵 **Currency Detection**: Identifies Indian currency notes using the Roboflow API and a webcam.
-- 🖼️ **Object Detection**: Detects and names nearby objects using the Imagga API.
+- 🖼️ **Object Recognition**: Identifies objects in a single camera snapshot using Imagga.
+- 🚧 **Real-time Obstacle Warnings**: Uses a pretrained YOLO model to monitor camera frames and speak when a large detected object appears close and in front. Say “start obstacle detection”; press Q in the camera window to stop.
+- 🌄 **On-demand Scene Description**: Say “describe scene” to capture one frame and hear a short sentence summarizing the main image tags.
 - 🌦️ **Weather Updates**: Provides real-time temperature, humidity, and weather conditions.
 - 📰 **News Headlines**: Fetches latest news based on your location via NewsAPI.
 - 🌐 **Translation**: Converts English text into Hindi using Google Translate.
@@ -35,6 +37,7 @@ pip install -r requirements.txt
 - `opencv-python` – Webcam capture
 - `requests` – API communication
 - `pyaudio` – Microphone access
+- `ultralytics` – YOLO object detection for obstacle warnings (downloads the model weights on first run)
 
 ---
 
@@ -63,7 +66,7 @@ This project is built with accessibility in mind, aiming to **assist blind and v
    ```bash
    git clone https://github.com/Pranavgit2008/Blind-Beacon.git
    ```
-2. Add your API keys in the code where placeholders are shown.
+2. Set the API keys as environment variables (see the API table below). For obstacle detection, install `ultralytics`; the YOLO weights download on first run.
 3. Run the script:
    ```bash
    python main.py
@@ -75,3 +78,8 @@ This project is built with accessibility in mind, aiming to **assist blind and v
 
 This project is open-source and available under the [MIT License](LICENSE).
 
+
+
+## 🚧 Obstacle detection safety note
+
+Obstacle warnings are based on detected object size and position in the camera image; they do **not** measure real-world distance and can miss obstacles or produce false alerts. This experimental feature must not replace a white cane, guide dog, or other established mobility aid. Use it only as a supplementary aid and test it carefully in a safe, controlled environment.
