@@ -289,6 +289,107 @@ def detect_objects():
             pass
 
 
+
+# ------------------------ Real-time obstacle detection ------------------
+def detect_obstacles():
+    """Monitor the camera and announce likely nearby obstacles.
+ 
+    This uses a pretrained COCO object detector. Bounding-box size and image
+    position are only rough visual cues, not reliable physical distance.
+    Press Q in the camera window to stop monitoring.
+    """
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        speak("Obstacle detection needs the ultralytics package. Install requirements and try again.")
+        return
+
+    speak("Starting obstacle detection. Keep using your cane or guide dog. Press Q in the camera window to stop.")
+    try:
+        model = YOLO(os.getenv("OBSTACLE_MODEL", "yolov8n.pt"))
+    except Exception as exc:
+        print(f"Could not load obstacle detection model: {exc}")
+        speak("I could not load the obstacle detection model.")
+        return
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        cap.release()
+        speak("I could not open the camera for obstacle detection.")
+        return
+
+    last_alert = {}
+    alert_cooldown = 4.0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                speak("Camera frame unavailable. Stopping obstacle detection.")
+                break
+            try:
+                result = model.predict(frame, imgsz=640, conf=0.45, verbose=False)[0]
+            except Exception as exc:
+                print(f"Obstacle inference failed: {exc}")
+                speak("Obstacle detection encountered an error.")
+                break
+
+            now = time.monotonic()
+            frame_area = max(1, frame.shape[0] * frame.shape[1])
+            if result.boxes is not None:
+                for box in result.boxes:
+                    try:
+                        cls_id = int(box.cls[0].item())
+                        label = str(model.names[cls_id]).lower()
+                        x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                    except (ValueError, TypeError, IndexError, AttributeError):
+                        continue
+                    box_area = max(0, x2 - x1) * max(0, y2 - y1)
+                    area_ratio = box_area / frame_area
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+                    # Warn on large objects near the center/lower part of the image.
+                    centered = abs(center_x - frame.shape[1] / 2) < frame.shape[1] * 0.30
+                    lower_or_center = center_y > frame.shape[0] * 0.40
+                    if area_ratio >= 0.18 and centered and lower_or_center:
+                        if now - last_alert.get(label, -100.0) >= alert_cooldown:
+                            speak(f"Warning. {label} appears close ahead. Please proceed carefully.")
+                            last_alert[label] = now
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    cv2.putText(frame, f"{label} {area_ratio:.0%}", (x1, max(20, y1 - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+            cv2.imshow("Blind-Beacon - Obstacle Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        speak("Obstacle detection stopped.")
+
+
+# ------------------------------ Scene description -----------------------
+def describe_scene():
+    """Capture one frame and speak a short description based on image tags."""
+    image_path = capture_image_from_webcam()
+    if not image_path:
+        return
+    try:
+        tags = tag_image_file(image_path, confidence_threshold=35)
+        if tags:
+            # Remove duplicate tags and keep the spoken description concise.
+            unique_tags = list(dict.fromkeys(tag.lower() for tag in tags if tag))[:3]
+            if len(unique_tags) == 1:
+                speak(f"This scene appears to show {unique_tags[0]}.")
+            else:
+                speak("This scene appears to show " + ", ".join(unique_tags[:-1]) + " and " + unique_tags[-1] + ".")
+        elif tags == []:
+            speak("I could not identify the scene clearly.")
+    finally:
+        try:
+            os.remove(image_path)
+        except OSError:
+            pass
+
 # -------------------------------- Weather --------------------------------
 def get_weather(api_key, city, country_code=""):
     if not api_key or api_key.lower().startswith("replace") or not city:
@@ -377,7 +478,7 @@ def translate_to_hindi(text):
 
 def main():
     wish_me()
-    speak("Blind Beacon is ready. Say currency, detect objects, the time, the weather, news, translate, or shutdown.")
+    speak("Blind Beacon is ready. Say start obstacle detection, describe scene, currency, detect objects, the time, the weather, news, translate, or shutdown.")
     while True:
         query = take_command()
         if not query:
@@ -386,6 +487,10 @@ def main():
         if "shutdown" in query or "exit assistant" in query or "quit assistant" in query:
             speak("Shutting down Blind Beacon.")
             break
+        elif "start obstacle detection" in query or "detect obstacles" in query or "obstacle detection" in query:
+            detect_obstacles()
+        elif "describe scene" in query or "describe the scene" in query or "describe surroundings" in query or "what does the scene look like" in query:
+            describe_scene()
         elif "currency" in query:
             detect_currency()
         elif "detect" in query or "identify objects" in query or "what is around me" in query:
