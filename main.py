@@ -1,366 +1,406 @@
-"""
-This voice-enabled assistant is designed to help visually impaired users perform tasks through speech. 
-It can recognize spoken commands, detect Indian currency using a webcam, identify nearby objects, and provide weather and news updates. 
-The assistant also supports English-to-Hindi translation and announces the current time. 
-Designed for accessibility, it offers hands-free interaction and audio feedback to assist blind users. 
-This code relies on multiple APIs and modules for optimal functionality. 
+"""Voice-enabled assistant for visually impaired users.
 
-You must obtain API keys from these websites:
-
-1. Roboflow API - For detecting Indian currency notes via webcam images.
-🔗 https://roboflow.com
-2. Imagga API - For object detection and tagging from webcam images.
-🔗 https://imagga.com
-3. OpenWeatherMap API - To fetch live weather information.
-🔗 https://openweathermap.org
-4. NewsAPI - To fetch the latest news headlines based on the city.
-🔗 https://newsapi.org
-
-Please ensure all required dependencies are properly installed and configured.
-
+Currency and image-tagging services require API credentials supplied through
+environment variables. This application uses cloud services; it is not a
+replacement for a mobility aid or professional navigation system.
 """
 
-import pyttsx3 
-import speech_recognition as sr 
 import datetime
+import os
+import re
+import time
+
 import cv2
+import pyttsx3
 import requests
+import speech_recognition as sr
+from googletrans import Translator
 
-# voice selecting function
-engine = pyttsx3.init('sapi5')
-voices = engine.getProperty('voices')
-# print(voices[1].id)
-engine.setProperty('voice', voices[1].id)
-rate = engine.getProperty('rate')   # Default rate is usually around 200
-engine.setProperty('rate', 180)
+# ----------------------------- Configuration -----------------------------
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "")
+ROBOFLOW_PROJECT = os.getenv(
+    "ROBOFLOW_PROJECT", "indian-currency-detector-boyiq"
+)
+ROBOFLOW_VERSION = os.getenv("ROBOFLOW_VERSION", "1")
+IMAGGA_API_KEY = os.getenv("IMAGGA_API_KEY", "")
+IMAGGA_API_SECRET = os.getenv("IMAGGA_API_SECRET", "")
+REQUEST_TIMEOUT = 15
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 
-#speak function
-def speak(audio):
-    engine.say(audio)
+# ------------------------------ Voice output -----------------------------
+engine = pyttsx3.init("sapi5")
+voices = engine.getProperty("voices")
+if voices:
+    # Prefer the second installed voice when available; otherwise use the first.
+    engine.setProperty("voice", voices[1 if len(voices) > 1 else 0].id)
+engine.setProperty("rate", 180)
+
+
+def speak(message):
+    """Print and speak a message."""
+    print(message)
+    engine.say(str(message))
     engine.runAndWait()
 
-#Wishing function
-def wishMe():
-    hour = int(datetime.datetime.now().hour)
-    if hour>=0 and hour<12:
-        speak("Good Morning!")
 
-    elif hour>=12 and hour<18:
-        speak("Good Afternoon!")   
-
+def wish_me():
+    hour = datetime.datetime.now().hour
+    if hour < 12:
+        speak("Good morning!")
+    elif hour < 18:
+        speak("Good afternoon!")
     else:
-        speak("Good Evening!")         
+        speak("Good evening!")
 
-#It takes microphone input from the user and returns string output
-def takeCommand():
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("Listening...")
-        r.pause_threshold = 1
-        r.adjust_for_ambient_noise(source)
-        audio = r.listen(source)
 
+def take_command():
+    """Listen for an Indian-English voice command; return an empty string on failure."""
+    recognizer = sr.Recognizer()
     try:
-        print("Recognizing...")    
-        query = r.recognize_google(audio, language='en-in')
-        print(f"User said:{query}")
+        with sr.Microphone() as source:
+            print("Listening...")
+            recognizer.pause_threshold = 1
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            audio = recognizer.listen(source, timeout=8, phrase_time_limit=10)
+        query = recognizer.recognize_google(audio, language="en-in")
+        print(f"You said: {query}")
+        return query.lower().strip()
+    except sr.WaitTimeoutError:
+        print("No speech detected.")
+    except sr.UnknownValueError:
+        print("Sorry, I couldn't understand. Please try again.")
+    except sr.RequestError as exc:
+        print(f"Speech recognition service error: {exc}")
+        speak("Speech recognition is currently unavailable.")
+    except (OSError, AttributeError) as exc:
+        print(f"Microphone error: {exc}")
+        speak("I cannot access the microphone. Please check its connection.")
+    return ""
 
-    except Exception as e:
-        # print(e)    
-        print("Say that again please...")  
-        return "None"
-    return query
-wishMe()
 
-# weather info gathering function using api of openweather
-def get_weather(api_key, city, country_code=''):   
-    base_url = "http://api.openweathermap.org/data/2.5/weather"
-                
-    params = {
-        'q': f'{city},{country_code}',
-        'appid': api_key,
-            }
+# ---------------------------- Currency detection -------------------------
+# Supports common model labels such as "five-hundred", "five_hundred",
+# "hundred_front", and "hundred_back". Update this map if your model uses
+# different class names.
+CURRENCY_LABELS = {
+    "five hundred": "500 rupees",
+    "two thousand": "2000 rupees",
+    "ten front": "10 rupees",
+    "ten back": "10 rupees",
+    "twenty front": "20 rupees",
+    "twenty back": "20 rupees",
+    "fifty front": "50 rupees",
+    "fifty back": "50 rupees",
+    "hundred front": "100 rupees",
+    "hundred back": "100 rupees",
+    "two hundred": "200 rupees",
+    # Alternate label orders sometimes used by datasets:
+    "front ten": "10 rupees",
+    "back ten": "10 rupees",
+    "front twenty": "20 rupees",
+    "back twenty": "20 rupees",
+    "front fifty": "50 rupees",
+    "back fifty": "50 rupees",
+    "front hundred": "100 rupees",
+    "back hundred": "100 rupees",
+}
 
-    response = requests.get(base_url, params=params)
 
-    if response.status_code == 200:
-        weather_data = response.json()
-        return weather_data
-    else:
+def normalize_label(label):
+    """Normalize punctuation and separators so label matching is resilient."""
+    return re.sub(r"[^a-z0-9]+", " ", str(label).lower()).strip()
+
+
+def denomination_for_label(label):
+    normalized = normalize_label(label)
+    if normalized in CURRENCY_LABELS:
+        return CURRENCY_LABELS[normalized]
+
+    # Match denomination names even when the model appends a side/version tag.
+    tokens = normalized.split()
+    if "thousand" in tokens and "two" in tokens:
+        return "2000 rupees"
+    if "hundred" in tokens and "five" in tokens:
+        return "500 rupees"
+    if "hundred" in tokens and "two" in tokens:
+        return "200 rupees"
+    if "hundred" in tokens:
+        return "100 rupees"
+    if "fifty" in tokens:
+        return "50 rupees"
+    if "twenty" in tokens:
+        return "20 rupees"
+    if "ten" in tokens:
+        return "10 rupees"
+    return None
+
+
+def detect_currency():
+    if not ROBOFLOW_API_KEY or ROBOFLOW_API_KEY.lower().startswith("replace"):
+        speak("Currency detection is not configured. Set the ROBOFLOW_API_KEY environment variable.")
+        return
+
+    url = f"https://detect.roboflow.com/{ROBOFLOW_PROJECT}/{ROBOFLOW_VERSION}"
+    params = {"api_key": ROBOFLOW_API_KEY, "confidence": 0.65, "overlap": 0.5}
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        speak("I could not open the camera. Please check the camera connection.")
+        cap.release()
+        return
+
+    last_spoken = {}
+    speak("Currency detection started. Press Q in the camera window to stop.")
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                speak("I could not capture an image from the camera.")
+                break
+
+            ok, encoded = cv2.imencode(".jpg", frame)
+            if not ok:
+                print("Could not encode camera frame.")
+                continue
+
+            try:
+                response = requests.post(
+                    url,
+                    params=params,
+                    files={"file": ("frame.jpg", encoded.tobytes(), "image/jpeg")},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                predictions = payload.get("predictions", [])
+            except (requests.RequestException, ValueError) as exc:
+                print(f"Roboflow request failed: {exc}")
+                cv2.imshow("Blind-Beacon - Currency Detection", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                time.sleep(0.2)
+                continue
+
+            now = time.monotonic()
+            for prediction in predictions:
+                label = prediction.get("class", "unknown")
+                try:
+                    confidence = float(prediction.get("confidence", 0))
+                    x = float(prediction["x"])
+                    y = float(prediction["y"])
+                    width = float(prediction["width"])
+                    height = float(prediction["height"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+                x1 = max(0, int(x - width / 2))
+                y1 = max(0, int(y - height / 2))
+                x2 = min(frame.shape[1] - 1, int(x + width / 2))
+                y2 = min(frame.shape[0] - 1, int(y + height / 2))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                cv2.putText(
+                    frame, f"{label} {confidence:.0%}", (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2
+                )
+
+                denomination = denomination_for_label(label)
+                # Speak only sufficiently confident detections and throttle repeats.
+                if denomination and confidence >= 0.65:
+                    if now - last_spoken.get(denomination, -30) >= 3:
+                        speak(denomination)
+                        last_spoken[denomination] = now
+
+            cv2.imshow("Blind-Beacon - Currency Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        speak("Currency detection stopped.")
+
+
+# ------------------------------ Object tagging ---------------------------
+def capture_image_from_webcam():
+    """Capture one frame and return its image path, or None on failure."""
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    try:
+        if not cap.isOpened():
+            speak("I could not open the camera.")
+            return None
+        ok, frame = cap.read()
+        if not ok:
+            speak("I could not capture an image.")
+            return None
+        image_path = "captured_image.jpg"
+        if not cv2.imwrite(image_path, frame):
+            speak("I could not save the captured image.")
+            return None
+        return image_path
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+def tag_image_file(image_path, confidence_threshold=30):
+    """Upload an image to Imagga and return high-confidence English tags."""
+    if not IMAGGA_API_KEY or not IMAGGA_API_SECRET:
+        speak("Object tagging is not configured. Set the IMAGGA_API_KEY and IMAGGA_API_SECRET environment variables.")
         return None
 
-# Main function
-while True:
-    query = takeCommand().lower()
-    # Translator
-    from googletrans import Translator
-    translator=Translator()
-    def Translate(translate):
-            # Text to translate
-            text_to_translate =translate
-            # Translate from English to Hindi
-            translation = translator.translate(text_to_translate, src='en', dest='hi')
-            translated_text = translation.text
-            # print("Original Text:", text_to_translate)
-            print("Translated Text:", translated_text)
-            speak(translated_text)
-
-    # Currency Detection using API
-    if 'currency' in query:
-            # Defineing API key 
-            ROBOFLOW_API_KEY = "Replace with your ROBOFLOW API" #API key is available at ROBOFLOW
-            MODEL_VERSION = "1"
-            PROJECT_NAME = "indian-currency-detector-boyiq"
-
-            # endpoint 
-            url = f"https://detect.roboflow.com/{PROJECT_NAME}/{MODEL_VERSION}"
-            params = {
-                "api_key": ROBOFLOW_API_KEY,
-                "confidence": 0.8,  # Adjust as needed
-                "overlap": 0.5
-            }
-
-            # Selecting the webcam feed
-            cap = cv2.VideoCapture(0) #Change camera input
-
-            while True:
-                # Capture frame-by-frame
-                ret, frame = cap.read()
-
-                if not ret:
-                    print("Failed to grab frame")
-                    break
-
-                
-                _, img_encoded = cv2.imencode('.jpg', frame)
-                image_data = img_encoded.tobytes()
-
-                # Posting the image to Roboflow API
-                response = requests.post(url, params=params, files={"file": image_data})
-
-                predictions = response.json()
-
-                # Drawing boxes on the frame
-                if response.status_code == 200:
-                    for prediction in predictions['predictions']:
-                        x, y, width, height = prediction['x'], prediction['y'], prediction['width'], prediction['height']
-                        label = prediction['class']
-
-                        x1, y1 = int(x - width / 2), int(y - height / 2)
-                        x2, y2 = int(x + width / 2), int(y + height / 2)
-
-                        # Drawing bounding box and label
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
-                        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-                        Str1=label.split("-")[0]
-                        Str2=label.split("-")[1]
-                        Str=Str1+'_'+Str2
-                        # print(Str,"Rupees")
-                        if Str=='five_hundred':
-                            # print("500 Rupees")
-                            var="500 Rupees"
-                            speak(var) 
-
-                        elif Str=='two_thousand':
-                            print("2000 Rupees")
-                            var="2000 Rupees"
-                            speak(var)
-                        
-                        elif Str=='ten_front':
-                            print("10 Rupees")
-                            var="10 Rupees"
-                            speak(var)
-
-                        elif Str=='ten_back':
-                            print("10 Rupees")
-                            var="10 Rupees"
-                            speak(var)
-
-                        elif Str=='hundred_front':
-                            print("100 Rupees")
-                            var="100 Rupees"
-                            speak(var)
-                        
-                        elif Str=='hundred_back':
-                            print("100 Rupees")
-                            var="100 Rupees"
-                            speak(var)
-
-                        elif Str=='twenty_front':
-                            print("20 Rupees")
-                            var="20 Rupees"
-                            speak(var)
-
-                        elif Str=='twenty_back':
-                            print("20 Rupees")
-                            var="20 Rupees"
-                            speak(var)
-
-                        elif Str=='two_hundred':
-                            print("200 Rupees")
-                            var="200 Rupees"
-                            speak(var)
-
-                        elif Str=='fifty_front':
-                            print("50 Rupees")
-                            var="50 Rupees"
-                            speak(var)
-                        
-                        elif Str=='fifty_back':
-                            print("50 Rupees")
-                            var="50 Rupees"
-                            speak(var)
+    url = "https://api.imagga.com/v2/tags"
+    try:
+        with open(image_path, "rb") as image_file:
+            response = requests.post(
+                url,
+                auth=(IMAGGA_API_KEY, IMAGGA_API_SECRET),
+                files={"image": image_file},
+                timeout=REQUEST_TIMEOUT,
+            )
+        response.raise_for_status()
+        data = response.json()
+        tags = data.get("result", {}).get("tags", [])
+        return [
+            item.get("tag", {}).get("en", "")
+            for item in tags
+            if float(item.get("confidence", 0)) >= confidence_threshold
+            and item.get("tag", {}).get("en")
+        ]
+    except (OSError, requests.RequestException, ValueError, TypeError) as exc:
+        print(f"Imagga request failed: {exc}")
+        speak("I was unable to analyze the image.")
+        return None
 
 
-                # Displaying the frame with result
-                cv2.imshow("Currency Detection", frame)
-
-                # Exit on pressing 'q'
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
-            # Release the capture and close windows
-            cap.release()
-            cv2.destroyAllWindows()
-
-    # Image Detection using Imangga API
-    elif 'detect' in query:
-        import time
-        import os
-
-        # Imagga API key
-        API_KEY = "Replace with your API key" #API key is available at Imangga                               
-        API_SECRET = "Replace with your API secret key" #API secret key is available at Imangga
-        auth = (API_KEY, API_SECRET)
-
-        # Capture image from webcam
-        def capture_image_from_webcam():
-            cap = cv2.VideoCapture(0)
-            ret, frame = cap.read()
-            if ret:
-                image_path = "captured_image.jpg"
-                cv2.imwrite(image_path, frame)
-            cap.release()
-            cv2.destroyAllWindows()
-            return image_path
-
-        # Posting the captured image to Imagga API
-        def tag_image_file(image_path, confidence_threshold=30):
-            url = "https://api.imagga.com/v2/tags"
-            with open(image_path, "rb") as image_file:
-                files = {"image": image_file}
-                response = requests.post(url, auth=auth, files=files)
-            
-            if response.status_code == 200:
-                tags = response.json().get("result", {}).get("tags", [])
-                filtered_tags = [tag["tag"]["en"] for tag in tags if tag["confidence"] > confidence_threshold]
-                return filtered_tags
-            else:
-                print("Error:", response.json())
-                return None
-
-        
-        image_path = capture_image_from_webcam()
+def detect_objects():
+    image_path = capture_image_from_webcam()
+    if not image_path:
+        return
+    try:
         tags = tag_image_file(image_path)
-
         if tags:
-            var1="I found " + ", ".join(tags) + " around you."
-            print(var1)
-            speak("I found " + ", ".join(tags) + " around you.")
-        else:
-            print("No high-confidence tags found.")
-        time.sleep(4)
-        if os.path.exists(image_path):
-            os.remove(image_path)
-        else:
-            print("Image file not found.")
-
-    # Time
-    elif 'the time' in query:
-        strTime = datetime.datetime.now().strftime("%I:%M %p")
-        strTime=strTime.replace(":","")    
-        speak(f"The time is {strTime}")
-
-    # Weather
-    elif 'the weather' in query:
-        def display_weather(weather_data):
-            if weather_data:
-                city_name="Replace with your city"
-                main_info = weather_data['main']
-                temperature_kelvin = main_info['temp']
-                humidity = main_info['humidity']
-                description = weather_data['weather'][0]['description']
-                # Converting kelvin to Celsius
-                temperature_celsius = temperature_kelvin - 273.15
-
-                print(f'Temperature in {city_name} is {temperature_celsius:.0f}°C and Humidity is {humidity}%')
-                speak(f'Temperature in {city_name} is {temperature_celsius:.0f}°C and Humidity is {humidity}%')
-                print(f'Feels like {description}')
-                speak(f'Feels like {description}')
-            else:
-                print('Failed to fetch weather data.')
-                speak('Failed to fetch weather data.')
-        if __name__ == "__main__":
-            api_key = 'Replace it with your API key' #API key is available at Openweathermap
-            city_name = 'Replace it with your city'
-            weather_data = get_weather(api_key, city_name)
-
-            display_weather(weather_data)
-
-    # News
-    elif 'news' in query:
-        def fetch_news_headlines(api_key, num_headlines=10):
-            # News API endpoint
-            url = f"https://newsapi.org/v2/everything?q={city_name}&language=en&apiKey={api_key}&pageSize={num_headlines}"
-            
-            # Make a request to the News API
-            response = requests.get(url)
-            
-            # Check if the request was successful
-            if response.status_code == 200:
-                news_data = response.json()
-                return news_data['articles']  
-            else:
-                print("Error:", response.status_code)
-                return []
-
-        def print_headlines(articles):
-            for article in articles:
-                print(f"- {article['title']}")
-                str=f"- {article['title']}"
-                speak(str)
-
-        if __name__ == "__main__":
-            api_key = "Replace it with your API key"  # API key available at newsapi
-            headlines = fetch_news_headlines(api_key,)
-
-            if headlines:
-                print(f"Latest News Headlines related to {city_name}:")
-                speak(f"Latest News Headlines related to {city_name}:")
-                print_headlines(headlines)
-                
-            else:
-                print("No headlines found.")
-                speak("No headlines found.")
-
-    # Translator works with hindi
-    elif 'translate' in query:
-        engine.setProperty('voice', voices[0].id) #Change voice here
-        rate = engine.getProperty('rate')   
-        engine.setProperty('rate', 180) # Default rate is usually around 200
-
+            # Limit the spoken list so the user is not overwhelmed by generic tags.
+            message = "I found: " + ", ".join(tags[:5]) + "."
+            speak(message)
+        elif tags == []:
+            speak("I could not identify any objects with sufficient confidence.")
+    finally:
         try:
-            speak("Translating...")
-            translate = query.replace("translate","")
-            translate = translate.replace("to hindi","")
-            # print(translate)
-            Translate(translate)
-        except Exception as e:
-            speak("I'am unable to translate the text to hindi")
+            os.remove(image_path)
+        except OSError:
+            pass
 
-    # To Close the program
-    elif 'shutdown' in query:
-        print("Shuting Down...")
-        speak("Shuting Down")
-        exit()
 
+# -------------------------------- Weather --------------------------------
+def get_weather(api_key, city, country_code=""):
+    if not api_key or api_key.lower().startswith("replace") or not city:
+        speak("Weather is not configured. Set OPENWEATHER_API_KEY and WEATHER_CITY.")
+        return None
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    try:
+        response = requests.get(
+            url,
+            params={"q": f"{city},{country_code}".strip(","), "appid": api_key},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"Weather request failed: {exc}")
+        return None
+
+
+def announce_weather():
+    city = os.getenv("WEATHER_CITY", "")
+    data = get_weather(os.getenv("OPENWEATHER_API_KEY", ""), city)
+    if not data:
+        speak("Failed to fetch weather information.")
+        return
+    main = data.get("main", {})
+    weather = data.get("weather", [{}])[0]
+    temp = main.get("temp")
+    humidity = main.get("humidity")
+    description = weather.get("description", "unknown conditions")
+    if temp is None:
+        speak("The weather service returned incomplete information.")
+        return
+    speak(
+        f"Weather in {data.get('name', city)}: {temp - 273.15:.0f} degrees Celsius, "
+        f"humidity {humidity if humidity is not None else 'unknown'} percent, "
+        f"{description}."
+    )
+
+
+# --------------------------------- News ----------------------------------
+def announce_news():
+    api_key = os.getenv("NEWS_API_KEY", "")
+    city = os.getenv("WEATHER_CITY", "")
+    if not api_key or not city:
+        speak("News is not configured. Set NEWS_API_KEY and WEATHER_CITY.")
+        return
+    try:
+        response = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": city, "language": "en", "apiKey": api_key,
+                "pageSize": 5, "sortBy": "publishedAt",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        articles = response.json().get("articles", [])
+        if not articles:
+            speak("No news headlines were found.")
+            return
+        speak(f"Here are the latest headlines related to {city}.")
+        for article in articles:
+            title = article.get("title")
+            if title:
+                speak(title)
+    except (requests.RequestException, ValueError) as exc:
+        print(f"News request failed: {exc}")
+        speak("I was unable to fetch the news.")
+
+
+# ------------------------------- Translation -----------------------------
+def translate_to_hindi(text):
+    text = re.sub(r"^translate\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*to hindi\s*$", "", text, flags=re.IGNORECASE).strip()
+    if not text:
+        speak("Please say the English text you want translated, for example: translate hello to Hindi.")
+        return
+    try:
+        translated = Translator().translate(text, src="en", dest="hi").text
+        speak(translated)
+    except Exception as exc:
+        print(f"Translation failed: {exc}")
+        speak("I was unable to translate that text.")
+
+
+def main():
+    wish_me()
+    speak("Blind Beacon is ready. Say currency, detect objects, the time, the weather, news, translate, or shutdown.")
+    while True:
+        query = take_command()
+        if not query:
+            continue
+
+        if "shutdown" in query or "exit assistant" in query or "quit assistant" in query:
+            speak("Shutting down Blind Beacon.")
+            break
+        elif "currency" in query:
+            detect_currency()
+        elif "detect" in query or "identify objects" in query or "what is around me" in query:
+            detect_objects()
+        elif "time" in query:
+            speak(f"The time is {datetime.datetime.now().strftime('%I:%M %p')}.")
+        elif "weather" in query:
+            announce_weather()
+        elif "news" in query or "headlines" in query:
+            announce_news()
+        elif "translate" in query:
+            translate_to_hindi(query)
+        else:
+            speak("Sorry, I don't recognize that command. Please try again.")
+
+
+if __name__ == "__main__":
+    main()
